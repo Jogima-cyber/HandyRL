@@ -29,7 +29,7 @@ class Generator:
             return None
 
         while not self.env.terminal():
-            moment_keys = ['observation', 'selected_prob', 'action_mask', 'action', 'value', 'reward', 'return']
+            moment_keys = ['observation', 'selected_prob', 'action_mask', 'unit_mask', 'action', 'value', 'reward', 'return']
             moment = {key: {p: None for p in self.env.players()} for key in moment_keys}
 
             turn_players = self.env.turns()
