@@ -51,14 +51,19 @@ class Generator:
 
                 if player in turn_players:
                     p_ = outputs['policy'].reshape(self.env.num_units(), -1)
-                    legal_actions = self.env.legal_actions(player)
-                    action_mask = np.ones_like(p_) * 1e32
-                    for i in range(p_.shape[0]):
-                        legal_actions = self.env.legal_actions(player, i)
-                        action_mask[i, legal_actions] = 0
+                    #legal_actions = self.env.legal_actions(player)
+                    #action_mask = np.ones_like(p_) * 1e32
+                    #for i in range(p_.shape[0]):
+                    #    legal_actions = self.env.legal_actions(player, i)
+                    #    action_mask[i, legal_actions] = 0
+                    action_mask = self.env.action_mask(player) * 1e32
+                    legal_unit = self.env.legal_units(player)
                     p = softmax(p_ - action_mask)
-                    action = [random.choices(np.arange(p.shape[-1]), weights=p[i])[0] for i in range(p.shape[0])]
-
+                    # here bottleneck ?
+                    action = np.zeros((p.shape[0],),dtype=np.int32)
+                    for i in legal_unit:
+                        action[i] = random.choices(np.arange(p.shape[-1]), weights=p[i])[0]
+                    #action = [random.choices(np.arange(p.shape[-1]), weights=p[i])[0] for i in range(p.shape[0])]
                     moment['selected_prob'][player] = np.take_along_axis(p, np.array(action)[:, None], -1)[:, 0]
                     moment['action_mask'][player] = action_mask
                     moment['action'][player] = action

@@ -194,14 +194,13 @@ def compose_losses(outputs, log_selected_policies, total_advantages, targets, ba
     Returns:
         tuple: losses and statistic values and the number of training data
     """
-
     tmasks = batch['turn_mask'].unsqueeze(-1).repeat(1, 1, 1, log_selected_policies.size(-2), 1)
     omasks = batch['observation_mask']
-
     losses = {}
     dcnt = tmasks.sum().item()
-
+    
     losses['p'] = (-log_selected_policies * total_advantages).mul(tmasks).sum()
+    print(batch['turn_mask'].shape, tmasks.shape, losses['p'].shape, (-log_selected_policies * total_advantages).shape)
     if 'value' in outputs:
         losses['v'] = ((outputs['value'] - targets['value']) ** 2).mul(omasks).sum() / 2
     if 'return' in outputs:
