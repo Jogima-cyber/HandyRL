@@ -60,6 +60,7 @@ def make_batch(episodes, args):
         # template for padding
         obs_zeros = map_r(moments[0]['observation'][moments[0]['turn'][0]], lambda o: np.zeros_like(o))
         amask_zeros = np.zeros_like(moments[0]['action_mask'][moments[0]['turn'][0]])
+        umask_zeros = np.zeros_like(moments[0]['unit_mask'][moments[0]['turn'][0]])
 
         # data that is changed by training configuration
         if args['turn_based_training'] and not args['observation']:
@@ -72,7 +73,8 @@ def make_batch(episodes, args):
             prob = np.array([[[replace_none(m['selected_prob'][player], 1.0)] for player in players] for m in moments])
             act = np.array([[replace_none(m['action'][player], 0) for player in players] for m in moments], dtype=np.int64)[..., np.newaxis]
             amask = np.array([[replace_none(m['action_mask'][player], amask_zeros + 1e32) for player in players] for m in moments])
-
+            umask = np.array([[replace_none(m['unit_mask'][player], 0) for player in players] for m in moments])[..., np.newaxis]
+            
         # reshape observation
         obs = rotate(rotate(obs))  # (T, P, ..., ...) -> (P, ..., T, ...) -> (..., T, P, ...)
         obs = bimap_r(obs_zeros, obs, lambda _, o: np.array(o))
@@ -92,6 +94,7 @@ def make_batch(episodes, args):
         # pad each array if step length is short
         batch_steps = args['burn_in_steps'] + args['forward_steps']
         if len(tmask) < batch_steps:
+            print("hello ?")
             pad_len_b = args['burn_in_steps'] - (ep['train_start'] - ep['start'])
             pad_len_a = batch_steps - len(tmask) - pad_len_b
             obs = map_r(obs, lambda o: np.pad(o, [(pad_len_b, pad_len_a)] + [(0, 0)] * (len(o.shape) - 1), 'constant', constant_values=0))
@@ -107,11 +110,10 @@ def make_batch(episodes, args):
             progress = np.pad(progress, [(pad_len_b, pad_len_a), (0, 0)], 'constant', constant_values=1)
 
         obss.append(obs)
-        datum.append((prob, v, act, oc, rew, ret, emask, tmask, omask, amask, progress))
+        datum.append((prob, v, act, oc, rew, ret, emask, tmask, omask, amask, umask, progress))
 
     obs = to_torch(bimap_r(obs_zeros, rotate(obss), lambda _, o: np.array(o)))
-    prob, v, act, oc, rew, ret, emask, tmask, omask, amask, progress = [to_torch(np.array(val)) for val in zip(*datum)]
-
+    prob, v, act, oc, rew, ret, emask, tmask, omask, amask, umask, progress = [to_torch(np.array(val)) for val in zip(*datum)]
     return {
         'observation': obs,
         'selected_prob': prob,
@@ -121,6 +123,7 @@ def make_batch(episodes, args):
         'episode_mask': emask,
         'turn_mask': tmask, 'observation_mask': omask,
         'action_mask': amask,
+        'unit_mask': umask,
         'progress': progress,
     }
 
@@ -200,21 +203,21 @@ def compose_losses(outputs, log_selected_policies, total_advantages, targets, ba
     dcnt = tmasks.sum().item()
     
     losses['p'] = (-log_selected_policies * total_advantages).mul(tmasks).sum()
-    print(batch['turn_mask'].shape, tmasks.shape, losses['p'].shape, (-log_selected_policies * total_advantages).shape)
     if 'value' in outputs:
         losses['v'] = ((outputs['value'] - targets['value']) ** 2).mul(omasks).sum() / 2
     if 'return' in outputs:
         losses['r'] = F.smooth_l1_loss(outputs['return'], targets['return'], reduction='none').mul(omasks).sum()
-
-    entropy = dist.Categorical(logits=outputs['policy']).entropy().mul(tmasks.squeeze(-1))
-    losses['ent'] = entropy.sum()
+    
+    # /!\ entropy does not take into account action mask, neither does it take into account multidiscrete actions
+    # entropy loss should be disabled for now
+    #entropy = dist.Categorical(logits=outputs['policy']).entropy().mul(tmasks.squeeze(-1))
+    #losses['ent'] = entropy.sum()
 
     base_loss = losses['p'] + losses.get('v', 0) + losses.get('r', 0)
-    entropy_loss = entropy.mul(1 - batch['progress'].unsqueeze(-1) * (1 - args['entropy_regularization_decay'])).sum() * -args['entropy_regularization']
-    losses['total'] = base_loss + entropy_loss
+    #entropy_loss = entropy.mul(1 - batch['progress'].unsqueeze(-1) * (1 - args['entropy_regularization_decay'])).sum() * -args['entropy_regularization']
+    losses['total'] = base_loss #+ entropy_loss
 
     return losses, dcnt
-
 
 def compute_loss(batch, model, hidden, args):
     outputs = forward_prediction(model, hidden, batch, args)
@@ -224,15 +227,20 @@ def compute_loss(batch, model, hidden, args):
 
     actions = batch['action']
     emasks = batch['episode_mask']
+    umasks = batch['unit_mask'].transpose(-2, -1)
     clip_rho_threshold, clip_c_threshold = 1.0, 1.0
-
+    
     log_selected_b_policies = torch.log(torch.clamp(batch['selected_prob'], 1e-16, 1)) * emasks.unsqueeze(-1)
     log_selected_t_policies = F.log_softmax(outputs['policy'], dim=-1).gather(-1, actions) * emasks.unsqueeze(-1)
-
+    
+    log_selected_t_policies = log_selected_t_policies.transpose(-2, -1)
+    
     # thresholds of importance sampling
     log_rhos = log_selected_t_policies.detach() - log_selected_b_policies
     rhos = torch.exp(log_rhos)
-    clipped_rhos = torch.clamp(rhos, 0, clip_rho_threshold)
+    clipped_rhos = torch.clamp(rhos, 0, clip_rho_threshold)*umasks
+    log_selected_t_policies = log_selected_t_policies*umasks
+
     cs = torch.clamp(rhos, 0, clip_c_threshold)
     outputs_nograd = {k: o.detach() for k, o in outputs.items()}
 
@@ -256,10 +264,9 @@ def compute_loss(batch, model, hidden, args):
     if args['policy_target'] != args['value_target']:
         _, advantages['value'] = compute_target(args['policy_target'], *value_args)
         _, advantages['return'] = compute_target(args['policy_target'], *return_args)
-
+    
     # compute policy advantage
     total_advantages = clipped_rhos * sum(advantages.values()).unsqueeze(-1)
-
     return compose_losses(outputs, log_selected_t_policies, total_advantages, targets, batch, args)
 
 
